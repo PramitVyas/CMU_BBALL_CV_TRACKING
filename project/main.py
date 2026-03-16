@@ -1,0 +1,112 @@
+import os
+import cv2
+import argparse
+import logging
+from datetime import datetime
+
+from basketball_player_tracker import PlayerTracker
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Basketball Tracking Pipeline")
+
+    parser.add_argument("--video", type=str, required=True,
+                        help="Path to input video file")
+
+    parser.add_argument("--detection_model", type=str, required=True,
+                        help="Path to player detection model")
+
+    parser.add_argument("--segmentation_model", type=str, default=None,
+                        help="Path to court segmentation model (optional)")
+
+    parser.add_argument("--court_coordinates", type=str, default=None,
+                        help="Path to court coordinates JSON (optional)")
+
+    parser.add_argument("--output_dir", type=str, default="outputs",
+                        help="Directory to save results")
+
+    parser.add_argument("--max_frames", type=int, default=None,
+                        help="Optional limit on number of frames to process")
+
+    parser.add_argument("--frame_step", type=int, default=1,
+                        help="Process every Nth frame")
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("main")
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # ---------------------------------------------------------
+    # Initialize tracker
+    # ---------------------------------------------------------
+    tracker = PlayerTracker(
+        detection_model_path=args.detection_model,
+        segmentation_model_path=args.segmentation_model,
+        court_coordinates_path=args.court_coordinates,
+        output_dir=args.output_dir
+    )
+
+    # ---------------------------------------------------------
+    # Open video
+    # ---------------------------------------------------------
+    cap = cv2.VideoCapture(args.video)
+    if not cap.isOpened():
+        logger.error(f"Could not open video: {args.video}")
+        return
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    logger.info(f"Video loaded: {args.video}")
+    logger.info(f"FPS: {fps}, Total frames: {total_frames}")
+
+    frame_idx = 0
+    processed = 0
+
+    vis_dir = os.path.join(args.output_dir, "vis")
+    os.makedirs(vis_dir, exist_ok=True)
+
+    # ---------------------------------------------------------
+    # Main loop
+    # ---------------------------------------------------------
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        if frame_idx % args.frame_step == 0:
+            timestamp = datetime.now().isoformat()
+
+            frame_data = tracker.process_frame(frame, frame_idx)
+
+            # Visualization
+            vis = tracker.visualize_frame(frame, frame_data)
+            vis_path = os.path.join(vis_dir, f"frame_{frame_idx:06d}.jpg")
+            cv2.imwrite(vis_path, vis["broadcast"])
+
+            logger.info(f"Processed frame {frame_idx}")
+            processed += 1
+
+            if args.max_frames is not None and processed >= args.max_frames:
+                break
+
+        frame_idx += 1
+
+    cap.release()
+
+    # ---------------------------------------------------------
+    # Save tracking JSON
+    # ---------------------------------------------------------
+    output_json = os.path.join(args.output_dir, "tracking_data.json")
+    tracker.save_tracking_data(output_json)
+
+    logger.info(f"Tracking complete. JSON saved to {output_json}")
+
+
+if __name__ == "__main__":
+    main()
