@@ -1,5 +1,18 @@
 import cv2
 import numpy as np
+import torch
+from tqdm import tqdm
+import supervision as sv
+
+from sports.basketball import (
+    CourtConfiguration,
+    League,
+    draw_court,
+    draw_points_on_court,
+    draw_paths_on_court,
+    ShotEventTracker
+)
+
 import os
 import json
 from typing import Dict, List, Tuple, Any, Optional
@@ -40,7 +53,7 @@ class PlayerTracker:
         output_dir: str = None,
         segmentation_model_path: Optional[str] = None,
         court_coordinates_path: Optional[str] = None,
-        device: str = "cuda" if cv2.cuda.getCudaEnabledDeviceCount() > 0 else "cpu"
+        device: str = "cuda" if torch.cuda.is_available() else "cpu"
     ):
         self.device = device
 
@@ -432,7 +445,7 @@ class PlayerTracker:
                 return {"error": f"Could not open video: {video_path}"}
 
             fps = cap.get(cv2.CAP_PROP_FPS)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            total_frames = int(cv2.CAP_PROP_FRAME_COUNT)
 
             start_frame = int(start_second * fps)
             end_frame = (

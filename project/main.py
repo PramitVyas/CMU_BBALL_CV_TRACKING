@@ -6,12 +6,19 @@ from datetime import datetime
 
 from basketball_player_tracker import PlayerTracker
 
+from pathlib import Path
+from paths import SOURCE_VIDEO_DIRECTORY
+
+
+def get_video_path(filename: str) -> Path:
+    return SOURCE_VIDEO_DIRECTORY / filename
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Basketball Tracking Pipeline")
 
     parser.add_argument("--video", type=str, required=True,
-                        help="Path to input video file")
+                        help="Filename of input video located in the source directory")
 
     parser.add_argument("--detection_model", type=str, required=True,
                         help="Path to player detection model")
@@ -42,6 +49,14 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # ---------------------------------------------------------
+    # Resolve video path
+    # ---------------------------------------------------------
+    video_path = get_video_path(args.video)
+
+    if not video_path.exists():
+        raise FileNotFoundError(f"Video not found: {video_path}")
+
+    # ---------------------------------------------------------
     # Initialize tracker
     # ---------------------------------------------------------
     tracker = PlayerTracker(
@@ -54,15 +69,15 @@ def main():
     # ---------------------------------------------------------
     # Open video
     # ---------------------------------------------------------
-    cap = cv2.VideoCapture(args.video)
+    cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        logger.error(f"Could not open video: {args.video}")
+        logger.error(f"Could not open video: {video_path}")
         return
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    logger.info(f"Video loaded: {args.video}")
+    logger.info(f"Video loaded: {video_path}")
     logger.info(f"FPS: {fps}, Total frames: {total_frames}")
 
     frame_idx = 0
@@ -110,3 +125,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
