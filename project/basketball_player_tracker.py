@@ -1,35 +1,98 @@
 import cv2
 import numpy as np
 import torch
-from tqdm import tqdm
-import supervision as sv
-
-from sports.basketball import (
-    CourtConfiguration,
-    League,
-    draw_court,
-    draw_points_on_court,
-    draw_paths_on_court,
-    ShotEventTracker
-)
-
-import os
 import json
-from typing import Dict, List, Tuple, Any, Optional
-from datetime import datetime
+import os
 import logging
 import time
+from datetime import datetime
+from typing import Dict, List, Tuple, Any, Optional
 
-from segmentation_processor import SegmentationProcessor
-from player_detector import PlayerDetector
-from homography_calculator import HomographyCalculator
 from ultralytics import YOLO
+from court_segmentation_processor import SegmentationProcessor
+from basketball_homography_calculator import HomographyCalculator
+from player_detector import PlayerDetector
 
+
+# ============================================================
+# SORT TRACKER IMPLEMENTATION
+# ============================================================
+
+from collections import deque
+
+class KalmanBoxTracker:
+    count = 0
+
+    def __init__(self, bbox):
+        self.id = KalmanBoxTracker.count
+        KalmanBoxTracker.count += 1
+
+        self.bbox = bbox
+        self.hits = 1
+        self.no_losses = 0
+        self.trace = deque(maxlen=10)
+
+    def update(self, bbox):
+        self.bbox = bbox
+        self.hits += 1
+        self.no_losses = 0
+        self.trace.append(bbox)
+
+    def predict(self):
+        self.no_losses += 1
+        return self.bbox
+
+
+class Sort:
+    def __init__(self, max_age=5, min_hits=1):
+        self.max_age = max_age
+        self.min_hits = min_hits
+        self.trackers = []
+
+    def update(self, detections):
+        updated_trackers = []
+
+        for det in detections:
+            matched = False
+            for trk in self.trackers:
+                iou = self._iou(det, trk.bbox)
+                if iou > 0.3:
+                    trk.update(det)
+                    updated_trackers.append(trk)
+                    matched = True
+                    break
+
+            if not matched:
+                new_trk = KalmanBoxTracker(det)
+                updated_trackers.append(new_trk)
+
+        self.trackers = [
+            t for t in updated_trackers if t.no_losses <= self.max_age
+        ]
+
+        return self.trackers
+
+    @staticmethod
+    def _iou(bb1, bb2):
+        x1 = max(bb1[0], bb2[0])
+        y1 = max(bb1[1], bb2[1])
+        x2 = min(bb1[2], bb2[2])
+        y2 = min(bb1[3], bb2[3])
+
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        if inter == 0:
+            return 0.0
+
+        area1 = (bb1[2] - bb1[0]) * (bb1[3] - bb1[1])
+        area2 = (bb2[2] - bb2[0]) * (bb2[3] - bb2[1])
+        return inter / float(area1 + area2 - inter)
+
+
+# ============================================================
+# JSON ENCODER
+# ============================================================
 
 class NumpyEncoder(json.JSONEncoder):
-    """
-    JSON encoder that can handle numpy arrays and other non-serializable types.
-    """
     def default(self, obj):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
@@ -39,14 +102,14 @@ class NumpyEncoder(json.JSONEncoder):
             return int(obj)
         if isinstance(obj, datetime):
             return obj.isoformat()
-        return super(NumpyEncoder, self).default(obj)
+        return super().default(obj)
 
+
+# ============================================================
+# PLAYER TRACKER
+# ============================================================
 
 class PlayerTracker:
-    """
-    Main module that integrates all components to track players in basketball broadcast footage.
-    """
-
     def __init__(
         self,
         detection_model_path: str,
@@ -56,8 +119,8 @@ class PlayerTracker:
         device: str = "cuda" if torch.cuda.is_available() else "cpu"
     ):
         self.device = device
-
         self.output_dir = output_dir
+
         if output_dir and not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
@@ -78,16 +141,17 @@ class PlayerTracker:
         self.tracking_data = {}
         self.logger = logging.getLogger(__name__)
 
-    # -------------------------------------------------------------------------
-    # METRICS
-    # -------------------------------------------------------------------------
-    def calculate_player_metrics(
-        self,
-        current_player: Dict,
-        frame_id: int,
-        prev_frame_data: Optional[Dict] = None
-    ) -> Dict:
+        self.sort_tracker = Sort()
 
+        import numpy as np
+        self.H_left = np.load("homography/H_left.npy")
+        self.H_right = np.load("homography/H_right.npy")
+
+    # ============================================================
+    # METRICS
+    # ============================================================
+
+    def calculate_player_metrics(self, current_player, frame_id, prev_frame_data):
         metrics = {
             "speed": 0.0,
             "acceleration": 0.0,
@@ -126,11 +190,14 @@ class PlayerTracker:
 
         return metrics
 
-    # -------------------------------------------------------------------------
-    # PROCESS SINGLE FRAME
-    # -------------------------------------------------------------------------
-    def process_frame(self, frame: np.ndarray, frame_id: int, debug_mode: bool = False) -> Dict:
+    def compute_blend_factor(self, frame_id):
+        return 0.5
 
+    # ============================================================
+    # PROCESS FRAME
+    # ============================================================
+
+    def process_frame(self, frame: np.ndarray, frame_id: int, debug_mode: bool = False) -> Dict:
         frame_height, frame_width = frame.shape[:2]
 
         frame_data = {
@@ -142,7 +209,7 @@ class PlayerTracker:
         prev_frame_data = self.tracking_data.get(frame_id - 1)
 
         # ---------------------------------------------------------
-        # Step 1: Court segmentation + homography
+        # Segmentation + Homography
         # ---------------------------------------------------------
         if self.segmentation_processor:
             seg_result = self.segmentation_processor.process_frame(
@@ -152,10 +219,11 @@ class PlayerTracker:
 
             if self.homography_calculator:
                 try:
-                    H = self.homography_calculator.calculate_homography(
-                        seg_result["features"],
-                        frame_id
-                    )
+                    t = self.compute_blend_factor(frame_id)
+                    H = self.homography_calculator.interpolate_homography(
+                        self.H_left,
+                        self.H_right,
+                        t)
 
                     if H is not None:
                         frame_data["homography_matrix"] = H.tolist()
@@ -174,22 +242,37 @@ class PlayerTracker:
                     frame_data["homography_success"] = False
 
         # ---------------------------------------------------------
-        # Step 2: Player detection
+        # YOLO Detection
         # ---------------------------------------------------------
         detections = []
         if self.player_detector:
             detections = self.player_detector.process_frame(frame, frame_id)
 
+        det_boxes = [det["bbox"] for det in detections]
+
         # ---------------------------------------------------------
-        # Step 3: Process each detected player
+        # SORT Tracking
+        # ---------------------------------------------------------
+        trackers = self.sort_tracker.update(det_boxes)
+
+        id_map = {}
+        for trk in trackers:
+            id_map[tuple(trk.bbox)] = trk.id
+
+        # ---------------------------------------------------------
+        # Build Player Entries
         # ---------------------------------------------------------
         for det in detections:
+            bbox = det["bbox"]
+            pid = id_map.get(tuple(bbox), None)
+
             player_data = {
-                "bbox": det["bbox"],
+                "id": pid,
+                "bbox": bbox,
                 "confidence": det["confidence"]
             }
 
-            x1, y1, x2, y2 = det["bbox"]
+            x1, y1, x2, y2 = bbox
             bottom_center = ((x1 + x2) / 2, y2)
 
             if frame_data.get("homography_success", False):
@@ -216,16 +299,98 @@ class PlayerTracker:
         self.tracking_data[frame_id] = frame_data
         return frame_data
 
-    # -------------------------------------------------------------------------
-    # VISUALIZATION
-    # -------------------------------------------------------------------------
-    def visualize_frame(
-        self,
-        frame: np.ndarray,
-        frame_data: Dict,
-        debug_mode: bool = False
-    ) -> Dict[str, np.ndarray]:
+    def process_frame_with_roboflow(
+            self,
+            frame: np.ndarray,
+            frame_id: int,
+            mask_by_class: Dict[str, np.ndarray],
+            players: List[Dict],
+            debug_mode: bool = False
+        ) -> Dict:
 
+        frame_height, frame_width = frame.shape[:2]
+
+        frame_data = {
+            "frame_id": frame_id,
+            "timestamp": datetime.now().isoformat(),
+            "players": []
+        }
+
+        prev_frame_data = self.tracking_data.get(frame_id - 1)
+
+        # ---------------------------------------------------------
+        # Homography (interpolated MVP version)
+        # ---------------------------------------------------------
+        H = None
+        if self.homography_calculator:
+            try:
+                t = self.compute_blend_factor(frame_id)
+                H = self.homography_calculator.interpolate_homography(
+                    self.H_left,
+                    self.H_right,
+                    t
+                )
+
+                if H is not None:
+                    frame_data["homography_matrix"] = H.tolist()
+                    frame_data["homography_success"] = True
+                else:
+                    frame_data["homography_success"] = False
+
+            except Exception as e:
+                self.logger.error(f"Error computing interpolated homography: {e}")
+                frame_data["homography_success"] = False
+
+        # ---------------------------------------------------------
+        # Build Player Entries from Roboflow detections
+        # ---------------------------------------------------------
+        for det in players:
+            bbox = det["bbox"]
+            pid = det.get("id")
+
+            player_data = {
+                "id": pid,
+                "bbox": bbox,
+                "confidence": det.get("confidence", 1.0)
+            }
+
+            x1, y1, x2, y2 = bbox
+            bottom_center = ((x1 + x2) / 2, y2)
+
+            # -----------------------------------------------------
+            # Project to court coordinates using interpolated H
+            # -----------------------------------------------------
+            if frame_data.get("homography_success", False):
+                try:
+                    pt = np.array([[[bottom_center[0], bottom_center[1]]]], dtype=np.float32)
+                    court_pt = cv2.perspectiveTransform(pt, H)[0][0]
+                    court_pos = [float(court_pt[0]), float(court_pt[1])]
+                    player_data["court_position"] = court_pos
+
+                    # -------------------------------------------------
+                    # Metrics (speed, acceleration, orientation)
+                    # -------------------------------------------------
+                    metrics = self.calculate_player_metrics(
+                        current_player=player_data,
+                        frame_id=frame_id,
+                        prev_frame_data=prev_frame_data
+                    )
+                    player_data.update(metrics)
+
+                except Exception as e:
+                    self.logger.error(f"Error projecting point: {e}")
+
+            frame_data["players"].append(player_data)
+
+        # Save for next frame
+        self.tracking_data[frame_id] = frame_data
+        return frame_data
+
+    # ============================================================
+    # VISUALIZATION
+    # ============================================================
+
+    def visualize_frame(self, frame, frame_data, debug_mode=False):
         visualizations = {}
         broadcast_vis = frame.copy()
 
@@ -293,11 +458,11 @@ class PlayerTracker:
         visualizations["broadcast"] = broadcast_vis
         return visualizations
 
-    # -------------------------------------------------------------------------
+    # ============================================================
     # SAVE TRACKING DATA
-    # -------------------------------------------------------------------------
-    def save_tracking_data(self, output_path: str) -> str:
+    # ============================================================
 
+    def save_tracking_data(self, output_path: str) -> str:
         serializable_data = {}
 
         print(f"Preparing tracking data for saving ({len(self.tracking_data)} frames)...")
@@ -358,171 +523,39 @@ class PlayerTracker:
             print(f"Error saving tracking data: {str(e)}")
             return None
 
-    # -------------------------------------------------------------------------
-    # TRACK PLAYERS (ALTERNATE ENTRY POINT)
-    # -------------------------------------------------------------------------
-    def track_players(self, frame, frame_idx, timestamp):
+    def visualize_court(self, frame_data):
+        """
+        MVP: Draw players on a 2D court map using court_position only.
+        """
 
-        frame_data = {
-            "frame_idx": frame_idx,
-            "timestamp": timestamp,
-            "players": [],
-            "homography_success": False
-        }
+        # Load your static 2D court image (must match your JSON coordinate system)
+        court_img = cv2.imread("basketball-court.png")  # adjust if needed
+        if court_img is None:
+            raise FileNotFoundError("basketball-court.png not found")
 
-        if self.segmentation_processor:
-            seg_result = self.segmentation_processor.process_frame(frame)
-            frame_data["segmentation_features"] = seg_result.get("features", {})
+        vis = court_img.copy()
 
-            if self.homography_calculator:
-                try:
-                    H = self.homography_calculator.calculate_homography(
-                        seg_result.get("features", {}),
-                        frame_idx
-                    )
+        # Draw each player
+        for p in frame_data["players"]:
+            if "court_position" not in p:
+                continue
 
-                    if H is not None:
-                        frame_data["homography_matrix"] = H.tolist()
-                        frame_data["homography_success"] = True
-                    else:
-                        H = self.homography_calculator.get_homography_matrix(frame_idx)
-                        if H is not None:
-                            frame_data["homography_matrix"] = H.tolist()
-                            frame_data["homography_success"] = True
-                            frame_data["homography_interpolated"] = True
+            cx, cy = p["court_position"]
+            cx = int(cx)
+            cy = int(cy)
 
-                except Exception as e:
-                    self.logger.error(f"Error calculating homography: {e}")
-                    frame_data["homography_success"] = False
+            # Player dot
+            cv2.circle(vis, (cx, cy), 8, (0, 0, 255), -1)
 
-        detections = self.player_detector.process_frame(frame, frame_idx)
+        # Frame label
+        cv2.putText(
+            vis,
+            f"Frame {frame_data['frame_id']}",
+            (30, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.2,
+            (255, 255, 255),
+            3
+        )
 
-        players_out = []
-
-        for det in detections:
-            x1, y1, x2, y2 = det["bbox"]
-            bottom_center = ((x1 + x2) / 2, y2)
-
-            player_entry = {
-                "bbox": det["bbox"],
-                "confidence": det["confidence"]
-            }
-
-            if frame_data.get("homography_success", False):
-                try:
-                    H = np.array(frame_data["homography_matrix"])
-                    court_pos = self.homography_calculator.project_point_to_court(
-                        bottom_center, H
-                    )
-                    if court_pos:
-                        player_entry["court_position"] = court_pos
-
-                except Exception as e:
-                    self.logger.error(f"Error projecting player position: {e}")
-
-            players_out.append(player_entry)
-
-        frame_data["players"] = players_out
-        return frame_data
-
-    # -------------------------------------------------------------------------
-    # PROCESS VIDEO CLIP
-    # -------------------------------------------------------------------------
-    def process_video_clip(
-        self,
-        video_path,
-        start_second=0,
-        num_seconds=5,
-        frame_step=1,
-        max_frames=None
-    ):
-        results = {}
-
-        try:
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                self.logger.error(f"Could not open video: {video_path}")
-                return {"error": f"Could not open video: {video_path}"}
-
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            total_frames = int(cv2.CAP_PROP_FRAME_COUNT)
-
-            start_frame = int(start_second * fps)
-            end_frame = (
-                int((start_second + num_seconds) * fps)
-                if num_seconds > 0 else total_frames
-            )
-
-            if max_frames is not None and (end_frame - start_frame) > max_frames:
-                end_frame = start_frame + max_frames
-
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-
-            frame_idx = start_frame
-            output_frames = []
-
-            vis_dir = os.path.join(self.output_dir, "vis")
-            os.makedirs(vis_dir, exist_ok=True)
-
-            while frame_idx < end_frame:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-
-                if (frame_idx - start_frame) % frame_step == 0:
-                    timestamp = frame_idx / fps
-
-                    frame_data = self.process_frame(frame, frame_idx)
-
-                    if len(self.tracking_data) == 0:
-                        players = frame_data["players"]
-                        players = sorted(players, key=lambda p: p["bbox"][0])
-                        for idx, p in enumerate(players):
-                            p["id"] = idx + 1
-                    else:
-                        prev_players = self.tracking_data[frame_idx - frame_step]["players"]
-                        for idx, p in enumerate(frame_data["players"]):
-                            p["id"] = prev_players[idx]["id"]
-
-                    self.tracking_data[frame_idx] = frame_data
-                    output_frames.append(frame_data)
-
-                    vis = self.visualize_frame(frame, frame_data)
-                    vis_path = os.path.join(vis_dir, f"frame_{frame_idx}.jpg")
-                    cv2.imwrite(vis_path, vis["broadcast"])
-
-                    self.logger.info(f"Processed frame {frame_idx}")
-
-                frame_idx += 1
-
-                if max_frames is not None and (frame_idx - start_frame) >= max_frames * frame_step:
-                    break
-
-            output_file = os.path.join(
-                self.output_dir,
-                f"tracking_data_{int(time.time())}.json"
-            )
-            self.save_tracking_data(output_file)
-
-            results = {
-                "video_info": {
-                    "path": video_path,
-                    "fps": fps,
-                    "total_frames": total_frames,
-                    "processed_frames": len(output_frames)
-                },
-                "frames": output_frames,
-                "tracking_data_file": output_file
-            }
-
-            self.logger.info(f"Tracking data saved to {output_file}")
-
-        except Exception as e:
-            self.logger.error(f"Error processing video: {e}")
-            results = {"error": str(e)}
-
-        finally:
-            if "cap" in locals() and cap is not None:
-                cap.release()
-
-        return results
+        return vis

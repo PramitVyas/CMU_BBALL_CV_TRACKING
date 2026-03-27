@@ -1,7 +1,7 @@
 from pathlib import Path
 
 # Project root
-HOME = Path(__file__).resolve().parent
+HOME = Path(__file__).resolve().parent.parent
 
 # Standard subdirectories
 SOURCE_VIDEO_DIRECTORY = HOME / "source"
