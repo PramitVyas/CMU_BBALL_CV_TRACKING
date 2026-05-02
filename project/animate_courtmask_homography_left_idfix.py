@@ -10,10 +10,10 @@ from scipy.spatial.distance import cdist
 OUT_DIR = "../outputs_courtmask"
 COURT_IMG = "basketball-court.png"
 HOMOGRAPHY_PATH = "homography/H_left.npy"
-OUTPUT_VIDEO = "test_animation_courtmask_homography_left_idfix.mp4"
+OUTPUT_VIDEO = "animation_courtmask_homography_left_idfix.mp4"
 FPS = 30
 
-MAX_IDS = 20  # force IDs to be 1–20
+MAX_IDS = 20  # force IDs to be 1–20 since there shouldn't be more than 20 players in a game
 
 
 # ---------------------------------------------------------

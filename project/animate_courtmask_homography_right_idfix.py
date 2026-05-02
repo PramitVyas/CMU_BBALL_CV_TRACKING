@@ -13,7 +13,7 @@ HOMOGRAPHY_PATH = "homography/H_right.npy"
 OUTPUT_VIDEO = "animation_courtmask_homography_right_idfix.mp4"
 FPS = 30
 
-MAX_IDS = 20  # force IDs to be 1–20
+MAX_IDS = 20  # force IDs to be 1–20 since there shouldn't be more than 20 players in a game
 
 
 # ---------------------------------------------------------
