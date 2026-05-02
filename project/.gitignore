@@ -1,1 +1,5 @@
-.env
+.ipynb_checkpoints/
+*.mp4
+*.pt
+segment-anything-2-real-time/
+CMU_Player_Tracking_Test.ipynb
